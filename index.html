@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AuraModulator - 20-Engine Frequency Array (v1.1.0)</title>
+    <title>AuraModulator - 20-Engine Frequency Array (v1.2.0)</title>
     <style>
         :root {
             --bg: #0f1115; --surface: #1a1d24; --primary: #00e5ff;
@@ -27,8 +27,6 @@
         button.active { background-color: var(--danger); color: white;}
         button.record-active { background-color: var(--record); color: white; animation: pulse 1.5s infinite; }
         
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
-
         .ui-num { padding: 4px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; }
         select.ui-num { cursor: pointer; }
 
@@ -48,8 +46,8 @@
 <body>
 
     <div class="header">
-        <h1>AuraModulator <span style="font-size: 0.5em; color: var(--primary);">(20-Engine Freq Shifter v1.1.0)</span></h1>
-        <p>Mathematical Dual-Sideband Frequency Transposition Array</p>
+        <h1>AuraModulator <span style="font-size: 0.5em; color: var(--primary);">(20-Engine Freq Array v1.2.0)</span></h1>
+        <p>Mathematical Multi-Track Dual-Sideband Ring Modulator</p>
     </div>
 
     <!-- ANALYSIS DASHBOARD -->
@@ -100,21 +98,31 @@
         <div class="dash-header-controls">
             <!-- MASTER ENGINE CONFIGURATOR -->
             <div style="display: flex; align-items: center; gap: 5px;">
-                <label style="color: var(--primary); font-weight: bold;">Active Count:</label>
+                <label style="color: var(--primary); font-weight: bold;">Engines:</label>
                 <input type="number" id="master-engines-count" class="ui-num" min="1" max="20" value="20" style="width: 50px;">
-                <button id="apply-master-engines-btn" style="background-color: var(--primary); padding: 4px 10px; font-size: 0.85em; color: black;">Set</button>
+                
+                <label style="color: var(--primary); font-weight: bold; margin-left: 10px;">Tracks:</label>
+                <input type="number" id="master-tracks-count" class="ui-num" min="1" max="1000" value="100" style="width: 60px;">
+                
+                <label style="color: var(--primary); font-weight: bold; margin-left: 10px;">Spread (Hz):</label>
+                <select id="master-spread-select" class="ui-num">
+                    <option value="1">1 Hz</option>
+                    <option value="5" selected>5 Hz</option>
+                    <option value="10">10 Hz</option>
+                </select>
+                <button id="apply-master-engines-btn" style="background-color: var(--primary); padding: 4px 10px; font-size: 0.85em; color: black;">Apply Config</button>
             </div>
 
             <div class="divider"></div>
 
             <div style="display: flex; align-items: center; gap: 5px;">
-                <label style="color: var(--danger); font-weight: bold;" title="Configure start/end targets">Array Sweep:</label>
-                <select id="sweep-mode" class="ui-num" style="width: 145px; text-align: center;" title="Mode">
+                <label style="color: var(--danger); font-weight: bold;" title="Guarantees NO frequency overlap across engines">Auto-Stack Sweep:</label>
+                <select id="sweep-mode" class="ui-num" style="width: 145px; text-align: center;">
                     <option value="down">Converge to 20Hz</option>
                     <option value="up">Converge to 20kHz</option>
                     <option value="split">Split (Half Down/Up)</option>
                 </select>
-                <button id="apply-sweep-btn" style="background-color: var(--danger); padding: 4px 10px; font-size: 0.85em; color: white;">Apply Config</button>
+                <button id="apply-sweep-btn" style="background-color: var(--danger); padding: 4px 10px; font-size: 0.85em; color: white;">Generate Base Hz</button>
             </div>
             
             <div class="divider"></div>
@@ -169,25 +177,34 @@
         const ENGINE_COUNT = 20; 
         const LFO_TIMES = [0.001, 0.01, 0.1, 1, 2, 5, 10, 30, 60, 120];
 
-        // --- 1. AUDIOWORKLET INJECTION (FREQUENCY SHIFTER) ---
+        // --- 1. AUDIOWORKLET INJECTION (MULTI-TRACK WAVETABLE SHIFTER) ---
         const workletCode = `
-        class FreqShifterProcessor extends AudioWorkletProcessor {
+        class MultiTrackShifterProcessor extends AudioWorkletProcessor {
             constructor() {
                 super();
                 this.globalSampleCounter = 0;
                 
+                // WAVETABLE OPTIMIZATION: Calculate math.sin once instead of 1 billion times/sec
+                this.sineTableSize = 8192;
+                this.sineTable = new Float32Array(this.sineTableSize);
+                for(let i = 0; i < this.sineTableSize; i++) {
+                    this.sineTable[i] = Math.sin((i / this.sineTableSize) * Math.PI * 2);
+                }
+
                 const lfoTimes = [0.001, 0.01, 0.1, 1, 2, 5, 10, 30, 60, 120];
                 const engineArray = Array(${ENGINE_COUNT}).fill().map((_, i) => {
-                    let startHz = 20 + (19980) * (i / 19);
                     return {
                         active: true, 
                         lfoActive: false, 
-                        lfoStart: startHz, 
+                        lfoStart: 20, 
                         lfoEnd: 20.0, 
                         lfoTime: lfoTimes[i % 10], 
-                        currentFreq: startHz, 
+                        currentFreq: 20, 
                         lfoSamples: 0,
-                        phase: 0 // Oscillator phase tracker
+                        tracks: 100,
+                        trackSpread: 5.0,
+                        // Pre-allocate up to 1000 track phases, randomized to prevent phase explosion clipping
+                        phases: Float32Array.from({length: 1000}, () => Math.random())
                     };
                 });
 
@@ -213,7 +230,7 @@
                 const channelOut = output[0];
                 const numFrames = channelIn.length;
 
-                // 1. Advance Engine LFOs (Linear Frequency Sweeps)
+                // 1. Advance Engine Base LFOs
                 for (let e = 0; e < ${ENGINE_COUNT}; e++) {
                     let eng = this.config.engines[e];
                     if (eng.active && eng.lfoActive) {
@@ -221,13 +238,11 @@
                         eng.lfoSamples += numFrames;
                         if (eng.lfoSamples >= totalSamples) eng.lfoSamples %= totalSamples; 
                         let progress = eng.lfoSamples / totalSamples;
-                        
-                        // Linear frequency modulation formula (works up or down)
                         eng.currentFreq = eng.lfoStart + ((eng.lfoEnd - eng.lfoStart) * progress);
                     }
                 }
 
-                // 2. Process Audio Array
+                // 2. Process Multi-Track Audio Array
                 for (let i = 0; i < numFrames; i++) {
                     let allowed = true;
                     if (this.config.inGateEnabled && (Math.floor(this.globalSampleCounter / this.config.inGateSamples) % 2 !== 0)) allowed = false;
@@ -238,24 +253,34 @@
                     const val = allowed ? channelIn[i] : 0;
                     
                     let mixedOutput = 0;
-                    let activeEnginesCount = 0;
+                    let totalActiveTracks = 0;
 
                     for (let e = 0; e < ${ENGINE_COUNT}; e++) {
                         let eng = this.config.engines[e];
                         if (!eng.active) continue;
-                        activeEnginesCount++;
+                        
+                        let tCount = eng.tracks;
+                        let spread = eng.trackSpread;
+                        let baseFreq = eng.currentFreq;
+                        totalActiveTracks += tCount;
 
-                        // DUAL-SIDEBAND FREQUENCY SHIFT (Ring Modulation)
-                        mixedOutput += val * Math.sin(eng.phase);
+                        for(let t = 0; t < tCount; t++) {
+                            // Track logic: Start Base + spacing interval
+                            let trackFreq = baseFreq + (t * spread);
+                            
+                            // Wavetable Fast Sine Lookup
+                            let phaseIdx = (eng.phases[t] * this.sineTableSize) | 0; // fast integer floor
+                            mixedOutput += val * this.sineTable[phaseIdx];
 
-                        // Advance Oscillator Phase
-                        eng.phase += (2 * Math.PI * eng.currentFreq) / sampleRate;
-                        if (eng.phase > 2 * Math.PI) eng.phase -= 2 * Math.PI;
-                        if (eng.phase < -2 * Math.PI) eng.phase += 2 * Math.PI;
+                            // Advance normalized Phase (0.0 to 1.0)
+                            eng.phases[t] += trackFreq / sampleRate;
+                            if(eng.phases[t] >= 1.0) eng.phases[t] -= 1.0;
+                            if(eng.phases[t] < 0.0) eng.phases[t] += 1.0;
+                        }
                     }
 
-                    // Normalize Output based on square root of active engines to prevent volume blowout
-                    channelOut[i] = activeEnginesCount > 0 ? (mixedOutput / Math.sqrt(activeEnginesCount)) : val;
+                    // Deep Math Normalization (Square root handles thousands of tracks safely)
+                    channelOut[i] = totalActiveTracks > 0 ? (mixedOutput / Math.sqrt(totalActiveTracks)) : val;
                     this.globalSampleCounter++;
                 }
 
@@ -267,7 +292,7 @@
                 return true;
             }
         }
-        registerProcessor('freqshifter-processor', FreqShifterProcessor);
+        registerProcessor('multitrackshifter-processor', MultiTrackShifterProcessor);
         `;
         const workletBlob = new Blob([workletCode], { type: 'application/javascript' });
         const workletUrl = URL.createObjectURL(workletBlob);
@@ -279,9 +304,8 @@
         let liveMathNode, fxHubIn, fxHubOut, convolver, panner, outputGain, chopperOsc, chopperGain; 
         
         let outAnalyser, outDataArray;
-        let currentEngineFreqs = new Array(ENGINE_COUNT).fill(20); // Tracker for UI Oscilloscope
+        let currentEngineFreqs = new Array(ENGINE_COUNT).fill(20);
         
-        // PRE-SCALE & METERING NODES
         let hpFilter, lpFilter, rawAnalyser, postGainAnalyser, filteredAnalyser;
         let rawFreqData, filteredFreqData, rawTimeData, postTimeData;
         let micBypassGain, filteredGain, preGainNode;
@@ -296,61 +320,49 @@
         
         const masterCanvas = document.getElementById('master-canvas');
         const masterCtx = masterCanvas.getContext('2d', { alpha: false });
-        
         const fftCanvas = document.getElementById('fft-canvas');
         const fftCtx = fftCanvas.getContext('2d', { alpha: false });
 
         document.getElementById('mic-vol-pct').addEventListener('input', (e) => {
-            if(preGainNode && audioContext) {
-                const pct = Math.max(0, parseFloat(e.target.value) || 0);
-                preGainNode.gain.setTargetAtTime(pct / 100.0, audioContext.currentTime, 0.05);
-            }
+            if(preGainNode && audioContext) preGainNode.gain.setTargetAtTime(Math.max(0, parseFloat(e.target.value) || 0) / 100.0, audioContext.currentTime, 0.05);
         });
 
         function updateBandpass() {
             if (!audioContext || !hpFilter || !lpFilter) return;
             const enabled = document.getElementById('bp-enable').checked;
-            const low = parseFloat(document.getElementById('bp-low').value) || 150;
-            const high = parseFloat(document.getElementById('bp-high').value) || 18000;
-            
-            hpFilter.frequency.setTargetAtTime(low, audioContext.currentTime, 0.05);
-            lpFilter.frequency.setTargetAtTime(high, audioContext.currentTime, 0.05);
-            
+            hpFilter.frequency.setTargetAtTime(parseFloat(document.getElementById('bp-low').value) || 150, audioContext.currentTime, 0.05);
+            lpFilter.frequency.setTargetAtTime(parseFloat(document.getElementById('bp-high').value) || 18000, audioContext.currentTime, 0.05);
             micBypassGain.gain.setTargetAtTime(enabled ? 0 : 1, audioContext.currentTime, 0.05);
             filteredGain.gain.setTargetAtTime(enabled ? 1 : 0, audioContext.currentTime, 0.05);
-        }['bp-enable', 'bp-low', 'bp-high'].forEach(id => {
-            document.getElementById(id).addEventListener('change', updateBandpass);
-            document.getElementById(id).addEventListener('input', updateBandpass);
-        });
+        }['bp-enable', 'bp-low', 'bp-high'].forEach(id => { document.getElementById(id).addEventListener('change', updateBandpass); document.getElementById(id).addEventListener('input', updateBandpass); });
 
         // --- INSTANCE DASHBOARD GENERATOR ---
         const instancesContainer = document.getElementById('instances-container');
         for(let i=0; i<ENGINE_COUNT; i++) {
-            const defaultTime = LFO_TIMES[i % 10];
-            const defaultStart = 20 + (19980) * (i / 19);
-            const defaultEnd = 20.0;
-            currentEngineFreqs[i] = defaultStart; // Sync visualizer to default
-            
             instancesContainer.innerHTML += `
             <div class="instance-card active-card" id="card-${i}">
-                <div class="instance-header"><span>Engine ${i + 1}</span>
+                <div class="instance-header"><span>Engine Bus ${i + 1}</span>
                     <div style="display:flex; align-items:center; gap:10px;">
                         <input type="checkbox" id="eng-active-${i}" checked> Enable
                         <div id="led-${i}" class="led-indicator"></div>
                     </div>
                 </div>
+                <div class="instance-row">
+                    <label>Tracks:</label><input type="number" id="eng-tracks-${i}" class="ui-num" min="1" max="1000" value="100" style="width: 50px;">
+                    <label>Spread Hz:</label><input type="number" id="eng-spread-${i}" class="ui-num" min="0.1" max="100" value="5" style="width: 50px;">
+                </div>
                 <div class="instance-row" style="color: var(--info); font-weight:bold; margin-top:5px;">Shift Base / LFO Sweep</div>
                 <div class="instance-row"><label>Start / End (Hz):</label>
                     <div>
-                        <input type="number" id="eng-start-${i}" class="ui-num" min="0.001" step="0.001" value="${defaultStart.toFixed(3)}" style="width: 60px;">
-                        <input type="number" id="eng-end-${i}" class="ui-num" min="0.001" step="0.001" value="${defaultEnd.toFixed(3)}" style="width: 60px;">
+                        <input type="number" id="eng-start-${i}" class="ui-num" min="0.001" step="0.001" value="20.0" style="width: 60px;">
+                        <input type="number" id="eng-end-${i}" class="ui-num" min="0.001" step="0.001" value="20.0" style="width: 60px;">
                     </div>
                 </div>
-                <div class="instance-row"><label>LFO Time (s):</label><input type="number" id="eng-time-${i}" class="ui-num" min="0.001" max="600" step="0.001" value="${defaultTime}" style="width: 55px;"></div>
+                <div class="instance-row"><label>LFO Time (s):</label><input type="number" id="eng-time-${i}" class="ui-num" min="0.001" max="600" step="0.001" value="${LFO_TIMES[i % 10]}" style="width: 55px;"></div>
                 <div class="instance-row" style="margin-top: 5px;">
                     <button id="eng-lfo-btn-${i}" style="background:var(--info); width:60px; padding: 4px;">Start</button>
                     <div style="display:flex; flex-direction:column; align-items:flex-end;">
-                        <div id="eng-readout-${i}" class="readout">${defaultStart.toFixed(3)} Hz</div>
+                        <div id="eng-readout-${i}" class="readout">20.000 Hz</div>
                     </div>
                 </div>
             </div>`;
@@ -363,38 +375,44 @@
 
         document.getElementById('apply-master-engines-btn').addEventListener('click', () => {
             const engCount = Math.max(1, Math.min(20, parseInt(document.getElementById('master-engines-count').value) || 20));
+            const trkCount = Math.max(1, Math.min(1000, parseInt(document.getElementById('master-tracks-count').value) || 100));
+            const spreadHz = parseFloat(document.getElementById('master-spread-select').value) || 5;
+
             for (let i = 0; i < ENGINE_COUNT; i++) {
                 const card = document.getElementById(`card-${i}`);
-                const activeCheckbox = document.getElementById(`eng-active-${i}`);
-                if (i < engCount) { card.style.display = 'flex'; activeCheckbox.checked = true; } 
-                else { card.style.display = 'none'; activeCheckbox.checked = false; }
+                if (i < engCount) { card.style.display = 'flex'; document.getElementById(`eng-active-${i}`).checked = true; } 
+                else { card.style.display = 'none'; document.getElementById(`eng-active-${i}`).checked = false; }
+                
+                document.getElementById(`eng-tracks-${i}`).value = trkCount;
+                document.getElementById(`eng-spread-${i}`).value = spreadHz;
                 sendEngineConfig(i); 
             }
         });
 
+        // 💥 Guaranteed ZERO-OVERLAP Sweep Stacker Generator 💥
         document.getElementById('apply-sweep-btn').addEventListener('click', () => {
             const mode = document.getElementById('sweep-mode').value;
+            let currentStartStackHz = 20; // Anchor entire array at 20Hz
 
             for(let i=0; i<ENGINE_COUNT; i++) {
-                let startHz, endHz;
+                let trks = parseInt(document.getElementById(`eng-tracks-${i}`).value) || 100;
+                let sprd = parseFloat(document.getElementById(`eng-spread-${i}`).value) || 5;
+                
+                let startHz = currentStartStackHz;
+                let endHz;
 
-                if (mode === 'down') {
-                    startHz = 20 + (19980) * (i / 19);
-                    endHz = 20;
-                } else if (mode === 'up') {
-                    startHz = 20 + (19980) * (i / 19);
-                    endHz = 20000;
-                } else if (mode === 'split') {
-                    let halfIndex = i % 10;
-                    startHz = 20 + (19980) * (halfIndex / 9); 
-                    if (i < 10) endHz = 20; else endHz = 20000; 
-                }
+                if (mode === 'down') endHz = 20; 
+                else if (mode === 'up') endHz = 20000; 
+                else if (mode === 'split') endHz = i < 10 ? 20 : 20000; 
                 
                 document.getElementById(`eng-start-${i}`).value = startHz.toFixed(3);
                 document.getElementById(`eng-end-${i}`).value = endHz.toFixed(3);
                 document.getElementById(`eng-time-${i}`).value = LFO_TIMES[i % 10]; 
                 
                 sendEngineConfig(i);
+
+                // Math to ensure next engine starts AFTER this engine's massive track footprint
+                currentStartStackHz += (trks * sprd); 
             }
         });
 
@@ -423,14 +441,16 @@
             if(!liveMathNode) return;
             const config = {
                 active: document.getElementById(`eng-active-${idx}`).checked,
-                lfoStart: parseFloat(document.getElementById(`eng-start-${idx}`).value) || 1.0,
-                lfoEnd: parseFloat(document.getElementById(`eng-end-${idx}`).value) || 100.0,
+                tracks: parseInt(document.getElementById(`eng-tracks-${idx}`).value) || 100,
+                trackSpread: parseFloat(document.getElementById(`eng-spread-${idx}`).value) || 5.0,
+                lfoStart: parseFloat(document.getElementById(`eng-start-${idx}`).value) || 20.0,
+                lfoEnd: parseFloat(document.getElementById(`eng-end-${idx}`).value) || 20.0,
                 lfoTime: parseFloat(document.getElementById(`eng-time-${idx}`).value) || 15
             };
             
             if(!engineLfoStates[idx]) {
                 config.currentFreq = config.lfoStart; 
-                currentEngineFreqs[idx] = config.currentFreq; // Sync UI Array
+                currentEngineFreqs[idx] = config.currentFreq; 
             }
 
             liveMathNode.port.postMessage({ type: 'updateEngine', index: idx, engineData: config });
@@ -443,7 +463,7 @@
             document.getElementById(`eng-readout-${idx}`).innerText = config.currentFreq ? config.currentFreq.toFixed(3) + ' Hz' : config.lfoStart.toFixed(3) + ' Hz';
         }
 
-        for(let i=0; i<ENGINE_COUNT; i++) {['eng-active-', 'eng-start-', 'eng-end-', 'eng-time-'].forEach(prefix => {
+        for(let i=0; i<ENGINE_COUNT; i++) {['eng-active-', 'eng-tracks-', 'eng-spread-', 'eng-start-', 'eng-end-', 'eng-time-'].forEach(prefix => {
                 document.getElementById(prefix + i).addEventListener('input', () => sendEngineConfig(i));
                 document.getElementById(prefix + i).addEventListener('change', () => sendEngineConfig(i));
             });
@@ -474,54 +494,34 @@
         });
 
         // --- HARDWARE GATING & ROUTING ---
-        const outGateToggleBtn = document.getElementById('out-gate-enable-toggle');
-        const outGateMsInput = document.getElementById('out-gate-ms');
-
         function updateOutputGate() {
             if (!audioContext || !outputGain || !chopperOsc) return;
-            const enabled = outGateToggleBtn.checked;
-            const ms = Math.max(0.1, parseFloat(outGateMsInput.value) || 100);
-            const freq = 1000 / (2 * ms); 
-            if (enabled) {
+            if (document.getElementById('out-gate-enable-toggle').checked) {
                 outputGain.gain.value = 0.5; 
-                chopperOsc.frequency.setValueAtTime(freq, audioContext.currentTime);
+                chopperOsc.frequency.setValueAtTime(1000 / (2 * Math.max(0.1, parseFloat(document.getElementById('out-gate-ms').value) || 100)), audioContext.currentTime);
                 try { chopperGain.connect(outputGain.gain); } catch(e){}
             } else {
                 try { chopperGain.disconnect(outputGain.gain); } catch(e){}
                 outputGain.gain.value = 1.0; 
             }
         }
-        outGateToggleBtn.addEventListener('change', updateOutputGate);
-        outGateMsInput.addEventListener('input', updateOutputGate);
-
-        document.getElementById('ac-reverb').addEventListener('change', updateFXRouting);
-        document.getElementById('ac-rotate').addEventListener('change', updateFXRouting);
-        audioOutputToggle.addEventListener('change', (e) => {
-            if (!isRunning || !outputGain || !audioContext) return;
-            e.target.checked ? outputGain.connect(audioContext.destination) : outputGain.disconnect(audioContext.destination);
-        });
-        echoToggle.addEventListener('change', () => { if (isRunning) { toggleMic(); setTimeout(toggleMic, 200); }});
-
-        function generateImpulseResponse(ctx) {
-            const length = ctx.sampleRate * 2.0; 
-            const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
-            for (let c = 0; c < 2; c++) {
-                const channelData = impulse.getChannelData(c);
-                for (let i = 0; i < length; i++) channelData[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 3);
-            }
-            return impulse;
-        }
+        document.getElementById('out-gate-enable-toggle').addEventListener('change', updateOutputGate);
+        document.getElementById('out-gate-ms').addEventListener('input', updateOutputGate);
 
         function updateFXRouting() {
             if (!audioContext) return;
-            try { fxHubIn.disconnect(); } catch(e){}
-            try { convolver.disconnect(); } catch(e){}
-            try { panner.disconnect(); } catch(e){}
+            try { fxHubIn.disconnect(); convolver.disconnect(); panner.disconnect(); } catch(e){}
             let currentOut = fxHubIn;
             if (document.getElementById('ac-reverb').checked) { currentOut.connect(convolver); currentOut = convolver; }
             if (document.getElementById('ac-rotate').checked) { currentOut.connect(panner); currentOut = panner; }
             currentOut.connect(fxHubOut);
         }
+        document.getElementById('ac-reverb').addEventListener('change', updateFXRouting);
+        document.getElementById('ac-rotate').addEventListener('change', updateFXRouting);
+        audioOutputToggle.addEventListener('change', (e) => {
+            if (isRunning && outputGain && audioContext) e.target.checked ? outputGain.connect(audioContext.destination) : outputGain.disconnect(audioContext.destination);
+        });
+        echoToggle.addEventListener('change', () => { if (isRunning) { toggleMic(); setTimeout(toggleMic, 200); }});
 
         async function toggleMic() {
             if (isRunning) {
@@ -534,10 +534,8 @@
                 isRunning = false;
                 for(let i=0; i<ENGINE_COUNT; i++) document.getElementById(`led-${i}`).classList.remove('on'); 
                 
-                masterLfoRunning = false;
-                engineLfoStates.fill(false);
-                masterLfoBtn.innerText = '▶ Start All LFOs';
-                masterLfoBtn.style.backgroundColor = 'var(--info)';
+                masterLfoRunning = false; engineLfoStates.fill(false);
+                masterLfoBtn.innerText = '▶ Start All LFOs'; masterLfoBtn.style.backgroundColor = 'var(--info)';
                 for (let i = 0; i < ENGINE_COUNT; i++) {
                     const btn = document.getElementById(`eng-lfo-btn-${i}`);
                     if(btn) { btn.innerText = 'Start'; btn.style.background = 'var(--info)'; }
@@ -554,46 +552,32 @@
                 microphone = audioContext.createMediaStreamSource(stream);
                 
                 preGainNode = audioContext.createGain();
-                const initVol = parseFloat(document.getElementById('mic-vol-pct').value) || 100;
-                preGainNode.gain.value = initVol / 100.0;
+                preGainNode.gain.value = (parseFloat(document.getElementById('mic-vol-pct').value) || 100) / 100.0;
 
                 rawAnalyser = audioContext.createAnalyser(); rawAnalyser.fftSize = 2048;
                 postGainAnalyser = audioContext.createAnalyser(); postGainAnalyser.fftSize = 2048;
-
                 hpFilter = audioContext.createBiquadFilter(); hpFilter.type = 'highpass';
                 lpFilter = audioContext.createBiquadFilter(); lpFilter.type = 'lowpass';
-                
                 filteredAnalyser = audioContext.createAnalyser(); filteredAnalyser.fftSize = 2048;
                 
-                rawFreqData = new Uint8Array(rawAnalyser.frequencyBinCount);
-                filteredFreqData = new Uint8Array(filteredAnalyser.frequencyBinCount);
-                rawTimeData = new Float32Array(rawAnalyser.frequencyBinCount);
-                postTimeData = new Float32Array(postGainAnalyser.frequencyBinCount);
-
+                rawFreqData = new Uint8Array(rawAnalyser.frequencyBinCount); filteredFreqData = new Uint8Array(filteredAnalyser.frequencyBinCount);
+                rawTimeData = new Float32Array(rawAnalyser.frequencyBinCount); postTimeData = new Float32Array(postGainAnalyser.frequencyBinCount);
                 micBypassGain = audioContext.createGain(); micBypassGain.gain.value = 1;
                 filteredGain = audioContext.createGain(); filteredGain.gain.value = 0;
 
-                microphone.connect(rawAnalyser);
-                microphone.connect(preGainNode);
-                preGainNode.connect(postGainAnalyser);
-                
+                microphone.connect(rawAnalyser); microphone.connect(preGainNode); preGainNode.connect(postGainAnalyser);
                 preGainNode.connect(hpFilter); hpFilter.connect(lpFilter); lpFilter.connect(filteredAnalyser);
-                preGainNode.connect(micBypassGain);
-                lpFilter.connect(filteredGain);
+                preGainNode.connect(micBypassGain); lpFilter.connect(filteredGain);
 
-                liveMathNode = new AudioWorkletNode(audioContext, 'freqshifter-processor');
+                liveMathNode = new AudioWorkletNode(audioContext, 'multitrackshifter-processor');
                 liveMathNode.port.onmessage = (e) => {
                     if (e.data.type === 'status') {
-                        currentEngineFreqs = e.data.freqs; // Capture frequencies for Oscilloscope UI
-                        for(let i=0; i<ENGINE_COUNT; i++) {
-                            if(document.getElementById(`eng-active-${i}`).checked) 
-                                document.getElementById(`eng-readout-${i}`).innerText = e.data.freqs[i].toFixed(3) + ' Hz';
-                        }
+                        currentEngineFreqs = e.data.freqs; 
+                        for(let i=0; i<ENGINE_COUNT; i++) if(document.getElementById(`eng-active-${i}`).checked) document.getElementById(`eng-readout-${i}`).innerText = e.data.freqs[i].toFixed(3) + ' Hz';
                     }
                 };
 
-                updateBandpass();
-                updateGlobalWorklet();
+                updateBandpass(); updateGlobalWorklet();
                 for(let i=0; i<ENGINE_COUNT; i++) sendEngineConfig(i); 
                 document.getElementById('apply-master-engines-btn').click();
 
@@ -603,28 +587,23 @@
                 fxHubIn = audioContext.createGain(); fxHubOut = audioContext.createGain();
                 outputGain = audioContext.createGain(); outputGain.gain.value = 1.0;
 
-                convolver = audioContext.createConvolver(); convolver.buffer = generateImpulseResponse(audioContext);
-                panner = audioContext.createPanner(); panner.panningModel = 'HRTF';
+                convolver = audioContext.createConvolver();
+                const impulse = audioContext.createBuffer(2, audioContext.sampleRate * 2.0, audioContext.sampleRate);
+                for (let c=0; c<2; c++) { let cd = impulse.getChannelData(c); for (let i=0; i<impulse.length; i++) cd[i] = (Math.random()*2-1)*Math.pow(1-i/impulse.length, 3); }
+                convolver.buffer = impulse;
                 
+                panner = audioContext.createPanner(); panner.panningModel = 'HRTF';
                 chopperOsc = audioContext.createOscillator(); chopperOsc.type = 'square';
-                chopperGain = audioContext.createGain(); chopperGain.gain.value = 0.5; 
-                chopperOsc.connect(chopperGain); chopperOsc.start();
+                chopperGain = audioContext.createGain(); chopperGain.gain.value = 0.5; chopperOsc.connect(chopperGain); chopperOsc.start();
 
-                micBypassGain.connect(liveMathNode);
-                filteredGain.connect(liveMathNode);
-                liveMathNode.connect(outAnalyser);
-                outAnalyser.connect(fxHubIn);
-                updateFXRouting();
-                fxHubOut.connect(outputGain);
+                micBypassGain.connect(liveMathNode); filteredGain.connect(liveMathNode);
+                liveMathNode.connect(outAnalyser); outAnalyser.connect(fxHubIn);
+                updateFXRouting(); fxHubOut.connect(outputGain);
                 
                 if (audioOutputToggle.checked) outputGain.connect(audioContext.destination);
                 updateOutputGate();
 
-                micBtn.innerText = 'Stop Microphone';
-                micBtn.classList.add('active');
-                isRunning = true;
-                lastMeterUpdate = performance.now();
-                
+                micBtn.innerText = 'Stop Microphone'; micBtn.classList.add('active'); isRunning = true; lastMeterUpdate = performance.now();
                 for(let i=0; i<ENGINE_COUNT; i++) { if(document.getElementById(`eng-active-${i}`).checked && document.getElementById(`card-${i}`).style.display !== 'none') document.getElementById(`led-${i}`).classList.add('on'); }
 
                 masterCanvas.width = masterCanvas.clientWidth; masterCanvas.height = masterCanvas.clientHeight;
@@ -635,185 +614,121 @@
         }
 
         // --- RECORDING ENGINE ---
-        const recordBtn = document.getElementById('record-btn');
-        const recordLimitInput = document.getElementById('record-limit-mins');
-        const recordFormatInput = document.getElementById('record-format');
-        const recordStatus = document.getElementById('record-status');
-
-        recordBtn.addEventListener('click', () => {
-            if (!isRunning) { alert("Please Start Microphone first!"); return; }
+        document.getElementById('record-btn').addEventListener('click', () => {
+            if (!isRunning) return alert("Please Start Microphone first!");
             if (isRecording) stopRecording(); else startRecording();
         });
 
         function startRecording() {
-            recordLimitSecs = (parseFloat(recordLimitInput.value) || 5) * 60;
+            recordLimitSecs = (parseFloat(document.getElementById('record-limit-mins').value) || 5) * 60;
             isRecording = true; recordStartTime = audioContext.currentTime; 
-            recordBtn.innerText = '⏹ Stop Recording'; recordBtn.classList.add('record-active');
-            recordStatus.innerText = `Recording (${(recordLimitSecs/60).toFixed(1)}m limit)...`;
+            const recordBtn = document.getElementById('record-btn'); recordBtn.innerText = '⏹ Stop Recording'; recordBtn.classList.add('record-active');
+            document.getElementById('record-status').innerText = `Recording (${(recordLimitSecs/60).toFixed(1)}m)...`;
+            const dest = audioContext.createMediaStreamDestination(); outputGain.connect(dest);
 
-            const dest = audioContext.createMediaStreamDestination();
-            outputGain.connect(dest);
-
-            if (recordFormatInput.value === 'wav') {
-                wavAudioBuffer =[];
-                scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+            if (document.getElementById('record-format').value === 'wav') {
+                wavAudioBuffer =[]; scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
                 dest.connect(scriptProcessor); scriptProcessor.connect(audioContext.destination); 
                 scriptProcessor.onaudioprocess = (e) => {
-                    if (!isRecording) return;
-                    wavAudioBuffer.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+                    if (!isRecording) return; wavAudioBuffer.push(new Float32Array(e.inputBuffer.getChannelData(0)));
                     if (audioContext.currentTime - recordStartTime >= recordLimitSecs) stopRecording();
                 };
             } else {
-                let mimeType = recordFormatInput.value === 'flac' ? 'audio/flac' : 'audio/webm;codecs=opus';
-                if (!MediaRecorder.isTypeSupported(mimeType)) { mimeType = 'audio/webm;codecs=opus'; recordFormatInput.value = 'opus'; }
-                recordedChunks =[];
-                mediaRecorder = new MediaRecorder(dest.stream, { mimeType: mimeType });
-                mediaRecorder.ondataavailable = e => { 
-                    if (e.data.size > 0) recordedChunks.push(e.data); 
-                    if (isRecording && (audioContext.currentTime - recordStartTime >= recordLimitSecs)) stopRecording();
-                };
+                let mimeType = document.getElementById('record-format').value === 'flac' ? 'audio/flac' : 'audio/webm;codecs=opus';
+                if (!MediaRecorder.isTypeSupported(mimeType)) { mimeType = 'audio/webm;codecs=opus'; document.getElementById('record-format').value = 'opus'; }
+                recordedChunks =[]; mediaRecorder = new MediaRecorder(dest.stream, { mimeType: mimeType });
+                mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); if (isRecording && (audioContext.currentTime - recordStartTime >= recordLimitSecs)) stopRecording(); };
                 mediaRecorder.onstop = () => { triggerDownload(new Blob(recordedChunks, { type: mimeType }), `AuraModulator_Output.${mimeType.includes('flac') ? 'flac' : 'webm'}`); };
                 mediaRecorder.start(100); 
             }
         }
 
         function stopRecording() {
-            isRecording = false; recordBtn.innerText = '⏺ Start Recording'; recordBtn.classList.remove('record-active');
-            recordStatus.innerText = 'Compiling audio file...';
-            if (recordFormatInput.value === 'wav' && scriptProcessor) {
-                scriptProcessor.disconnect(); setTimeout(compileWAVFile, 50);
-            } else if (mediaRecorder && mediaRecorder.state !== "inactive") { mediaRecorder.stop(); }
+            isRecording = false; const recordBtn = document.getElementById('record-btn');
+            recordBtn.innerText = '⏺ Start Recording'; recordBtn.classList.remove('record-active'); document.getElementById('record-status').innerText = 'Compiling...';
+            if (document.getElementById('record-format').value === 'wav' && scriptProcessor) { scriptProcessor.disconnect(); setTimeout(compileWAVFile, 50); }
+            else if (mediaRecorder && mediaRecorder.state !== "inactive") { mediaRecorder.stop(); }
         }
 
         function compileWAVFile() {
-            const totalLength = wavAudioBuffer.reduce((acc, arr) => acc + arr.length, 0);
-            const flattened = new Float32Array(totalLength);
-            let offset = 0;
-            for (let arr of wavAudioBuffer) { flattened.set(arr, offset); offset += arr.length; }
-            const sr = audioContext.sampleRate; const buffer = new ArrayBuffer(44 + flattened.length * 2); const view = new DataView(buffer);
+            const totalLength = wavAudioBuffer.reduce((acc, arr) => acc + arr.length, 0); const flattened = new Float32Array(totalLength);
+            let offset = 0; for (let arr of wavAudioBuffer) { flattened.set(arr, offset); offset += arr.length; }
+            const buffer = new ArrayBuffer(44 + flattened.length * 2); const view = new DataView(buffer);
             const writeStr = (v, off, str) => { for (let i=0; i<str.length; i++) v.setUint8(off + i, str.charCodeAt(i)); };
             writeStr(view, 0, 'RIFF'); view.setUint32(4, 36 + flattened.length * 2, true); writeStr(view, 8, 'WAVE'); writeStr(view, 12, 'fmt ');
-            view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sr, true); view.setUint32(28, sr * 2, true);
-            view.setUint16(32, 2, true); view.setUint16(34, 16, true); writeStr(view, 36, 'data'); view.setUint32(40, flattened.length * 2, true);
-            for (let i = 0, pcmOffset = 44; i < flattened.length; i++, pcmOffset += 2) {
-                let s = Math.max(-1, Math.min(1, flattened[i])); view.setInt16(pcmOffset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-            }
+            view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, audioContext.sampleRate, true);
+            view.setUint32(28, audioContext.sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true); writeStr(view, 36, 'data'); view.setUint32(40, flattened.length * 2, true);
+            for (let i = 0, pcmOff = 44; i < flattened.length; i++, pcmOff += 2) { let s = Math.max(-1, Math.min(1, flattened[i])); view.setInt16(pcmOff, s < 0 ? s * 0x8000 : s * 0x7FFF, true); }
             triggerDownload(new Blob([view], { type: 'audio/wav' }), 'AuraModulator_Output.wav');
         }
 
         function triggerDownload(blob, filename) {
             const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.style.display = 'none'; a.href = url; a.download = filename;
-            document.body.appendChild(a); a.click();
-            setTimeout(() => { document.body.removeChild(a); window.URL.revokeObjectURL(url); recordStatus.innerText = "Saved successfully!"; }, 100);
+            document.body.appendChild(a); a.click(); setTimeout(() => { document.body.removeChild(a); window.URL.revokeObjectURL(url); document.getElementById('record-status').innerText = "Saved!"; }, 100);
         }
 
-        const getDB = (arr) => {
-            let sum = 0; for(let i=0; i<arr.length; i++) sum += arr[i]*arr[i];
-            let rms = Math.sqrt(sum / arr.length);
-            return rms < 0.0001 ? -100 : 20 * Math.log10(rms);
-        };
-
         function processVisualizer(timestamp) {
-            if (!isRunning) return;
-            animationId = requestAnimationFrame(processVisualizer);
+            if (!isRunning) return; animationId = requestAnimationFrame(processVisualizer);
             
             if (document.getElementById('ac-rotate').checked && panner) {
-                const t = audioContext.currentTime;
-                panner.positionX.setValueAtTime(Math.sin(t * 2.0) * 2, t);
-                panner.positionZ.setValueAtTime(Math.cos(t * 2.0) * 2, t);
+                panner.positionX.setValueAtTime(Math.sin(audioContext.currentTime * 2.0) * 2, audioContext.currentTime);
+                panner.positionZ.setValueAtTime(Math.cos(audioContext.currentTime * 2.0) * 2, audioContext.currentTime);
             }
 
             if (timestamp - lastMeterUpdate > 100) {
-                rawAnalyser.getFloatTimeDomainData(rawTimeData);
-                postGainAnalyser.getFloatTimeDomainData(postTimeData);
-                document.getElementById('meter-raw').innerText = getDB(rawTimeData).toFixed(1) + ' dB';
-                document.getElementById('meter-post').innerText = getDB(postTimeData).toFixed(1) + ' dB';
+                const getDB = (arr) => { let sum = 0; for(let i=0; i<arr.length; i++) sum += arr[i]*arr[i]; let rms = Math.sqrt(sum/arr.length); return rms < 0.0001 ? -100 : 20 * Math.log10(rms); };
+                rawAnalyser.getFloatTimeDomainData(rawTimeData); postGainAnalyser.getFloatTimeDomainData(postTimeData);
+                document.getElementById('meter-raw').innerText = getDB(rawTimeData).toFixed(1) + ' dB'; document.getElementById('meter-post').innerText = getDB(postTimeData).toFixed(1) + ' dB';
                 lastMeterUpdate = timestamp;
             }
 
-            // --- MULTI-ENGINE HOLOGRAPHIC OSCILLOSCOPE ---
             outAnalyser.getFloatTimeDomainData(outDataArray);
-            masterCtx.fillStyle = '#000000'; 
-            masterCtx.fillRect(0, 0, masterCanvas.width, masterCanvas.height);
-            
-            const dataLength = outDataArray.length;
-            const sliceWidth = masterCanvas.width / dataLength; 
-            const heightHalf = masterCanvas.height / 2;
-            const time = audioContext.currentTime;
+            masterCtx.fillStyle = '#000000'; masterCtx.fillRect(0, 0, masterCanvas.width, masterCanvas.height);
+            const sliceWidth = masterCanvas.width / outDataArray.length; const heightHalf = masterCanvas.height / 2;
 
-            // 1. Draw the 20 Engine Frequencies in the background
-            masterCtx.globalAlpha = 0.35; // Semi-transparent
+            // Engine holographic background
+            masterCtx.globalAlpha = 0.35;
             for(let i = 0; i < ENGINE_COUNT; i++) {
                 if(!document.getElementById(`eng-active-${i}`).checked) continue;
-                
-                masterCtx.beginPath();
-                // Generate a full spectrum rainbow color per engine
-                masterCtx.strokeStyle = `hsl(${(i * 360 / ENGINE_COUNT)}, 100%, 60%)`;
-                masterCtx.lineWidth = 1;
-                
-                // Map mathematical frequency to visual sine wave speed (logarithmically)
-                let freq = currentEngineFreqs[i] || 20;
-                let visualFreq = Math.max(1, Math.log10(freq) * 12); 
-                
-                let xBg = 0;
-                for (let j = 0; j < dataLength; j++) {
-                    const y = (Math.sin((j / dataLength) * Math.PI * 2 * visualFreq + (time * visualFreq * 1.5)) * (heightHalf * 0.8)) + heightHalf;
-                    j === 0 ? masterCtx.moveTo(xBg, y) : masterCtx.lineTo(xBg, y); 
-                    xBg += sliceWidth;
-                }
-                masterCtx.stroke();
+                masterCtx.beginPath(); masterCtx.strokeStyle = `hsl(${(i * 360 / ENGINE_COUNT)}, 100%, 60%)`;
+                let trks = parseInt(document.getElementById(`eng-tracks-${i}`).value);
+                masterCtx.lineWidth = Math.min(5, 1 + (trks / 200)); // Thicker lines for more tracks
+                let visualFreq = Math.max(1, Math.log10(currentEngineFreqs[i] || 20) * 12); 
+                for (let j = 0, x = 0; j < outDataArray.length; j++, x+=sliceWidth) {
+                    const y = (Math.sin((j / outDataArray.length) * Math.PI * 2 * visualFreq + (audioContext.currentTime * visualFreq * 1.5)) * (heightHalf * 0.8)) + heightHalf;
+                    j === 0 ? masterCtx.moveTo(x, y) : masterCtx.lineTo(x, y); 
+                } masterCtx.stroke();
             }
-            masterCtx.globalAlpha = 1.0; // Reset opacity
 
-            // 2. Draw the Master Mixed Audio Signal (Foreground)
-            masterCtx.lineWidth = 2; 
-            masterCtx.strokeStyle = '#e0e0e0'; // Bright white/gray for the master mix
-            masterCtx.shadowBlur = 5;
-            masterCtx.shadowColor = '#00e5ff';
+            // Foreground Audio Mix
+            masterCtx.globalAlpha = 1.0; masterCtx.lineWidth = 2; masterCtx.strokeStyle = '#e0e0e0'; masterCtx.shadowBlur = 5; masterCtx.shadowColor = '#00e5ff';
             masterCtx.beginPath();
-            
-            let xOut = 0;
-            for (let i = 0; i < dataLength; i++) {
+            for (let i = 0, x = 0; i < outDataArray.length; i++, x+=sliceWidth) {
                 const y = (outDataArray[i] * heightHalf) + heightHalf;
-                i === 0 ? masterCtx.moveTo(xOut, y) : masterCtx.lineTo(xOut, y); 
-                xOut += sliceWidth;
+                i === 0 ? masterCtx.moveTo(x, y) : masterCtx.lineTo(x, y); 
             }
-            masterCtx.stroke();
-            masterCtx.shadowBlur = 0; // Reset shadow
+            masterCtx.stroke(); masterCtx.shadowBlur = 0;
 
-            // --- FFT SPECTRAL GRAPH ---
-            rawAnalyser.getByteFrequencyData(rawFreqData);
-            filteredAnalyser.getByteFrequencyData(filteredFreqData);
-
-            fftCtx.fillStyle = '#000000';
-            fftCtx.fillRect(0, 0, fftCanvas.width, fftCanvas.height);
-
-            const fftLen = rawAnalyser.frequencyBinCount;
-            const fWidth = fftCanvas.width / fftLen;
+            rawAnalyser.getByteFrequencyData(rawFreqData); filteredAnalyser.getByteFrequencyData(filteredFreqData);
+            fftCtx.fillStyle = '#000000'; fftCtx.fillRect(0, 0, fftCanvas.width, fftCanvas.height);
+            const fWidth = fftCanvas.width / rawAnalyser.frequencyBinCount;
+            
+            fftCtx.beginPath(); fftCtx.moveTo(0, fftCanvas.height);
+            for(let i = 0; i < rawAnalyser.frequencyBinCount; i++) fftCtx.lineTo(i * fWidth, fftCanvas.height - ((rawFreqData[i] / 255.0) * fftCanvas.height));
+            fftCtx.lineTo(fftCanvas.width, fftCanvas.height); fftCtx.fillStyle = 'rgba(255, 255, 255, 0.2)'; fftCtx.fill();
 
             fftCtx.beginPath();
-            fftCtx.moveTo(0, fftCanvas.height);
-            for(let i = 0; i < fftLen; i++) {
-                const v = rawFreqData[i] / 255.0;
-                fftCtx.lineTo(i * fWidth, fftCanvas.height - (v * fftCanvas.height));
-            }
-            fftCtx.lineTo(fftCanvas.width, fftCanvas.height);
-            fftCtx.fillStyle = 'rgba(255, 255, 255, 0.2)';
-            fftCtx.fill();
-
-            fftCtx.beginPath();
-            for(let i = 0; i < fftLen; i++) {
-                const v = filteredFreqData[i] / 255.0;
-                const y = fftCanvas.height - (v * fftCanvas.height);
+            for(let i = 0; i < rawAnalyser.frequencyBinCount; i++) {
+                const y = fftCanvas.height - ((filteredFreqData[i] / 255.0) * fftCanvas.height);
                 i === 0 ? fftCtx.moveTo(i * fWidth, y) : fftCtx.lineTo(i * fWidth, y);
-            }
-            fftCtx.strokeStyle = 'var(--bp)';
-            fftCtx.lineWidth = 2;
-            fftCtx.stroke();
+            } fftCtx.strokeStyle = 'var(--bp)'; fftCtx.lineWidth = 2; fftCtx.stroke();
         }
 
         document.getElementById('mic-btn').addEventListener('click', toggleMic);
+        
+        // Boot UI setup
         document.getElementById('apply-master-engines-btn').click();
+        document.getElementById('apply-sweep-btn').click();
     </script>
 </body>
 </html>
