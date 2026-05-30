@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AuraModulator - 20-Engine Frequency Array</title>
+    <title>AuraModulator - 20-Engine Frequency Array (v1.1.0)</title>
     <style>
         :root {
             --bg: #0f1115; --surface: #1a1d24; --primary: #00e5ff;
@@ -48,14 +48,14 @@
 <body>
 
     <div class="header">
-        <h1>AuraModulator <span style="font-size: 0.5em; color: var(--primary);">(20-Engine Freq Shifter)</span></h1>
+        <h1>AuraModulator <span style="font-size: 0.5em; color: var(--primary);">(20-Engine Freq Shifter v1.1.0)</span></h1>
         <p>Mathematical Dual-Sideband Frequency Transposition Array</p>
     </div>
 
     <!-- ANALYSIS DASHBOARD -->
     <div class="canvas-row">
         <div class="canvas-container">
-            <div class="canvas-label">Oscilloscope (Time Domain Output)</div>
+            <div class="canvas-label">Holographic Oscilloscope (Time Domain Output)</div>
             <canvas id="master-canvas"></canvas>
         </div>
         <div class="canvas-container">
@@ -230,7 +230,6 @@
                 // 2. Process Audio Array
                 for (let i = 0; i < numFrames; i++) {
                     let allowed = true;
-                    // Pre-Processing Gating logic
                     if (this.config.inGateEnabled && (Math.floor(this.globalSampleCounter / this.config.inGateSamples) % 2 !== 0)) allowed = false;
                     if (this.config.acEnabled) {
                         const chunk = Math.floor(this.globalSampleCounter / this.config.acSamples);
@@ -251,15 +250,12 @@
 
                         // Advance Oscillator Phase
                         eng.phase += (2 * Math.PI * eng.currentFreq) / sampleRate;
-                        
-                        // Keep phase within analytical boundaries
                         if (eng.phase > 2 * Math.PI) eng.phase -= 2 * Math.PI;
                         if (eng.phase < -2 * Math.PI) eng.phase += 2 * Math.PI;
                     }
 
                     // Normalize Output based on square root of active engines to prevent volume blowout
                     channelOut[i] = activeEnginesCount > 0 ? (mixedOutput / Math.sqrt(activeEnginesCount)) : val;
-                    
                     this.globalSampleCounter++;
                 }
 
@@ -283,6 +279,7 @@
         let liveMathNode, fxHubIn, fxHubOut, convolver, panner, outputGain, chopperOsc, chopperGain; 
         
         let outAnalyser, outDataArray;
+        let currentEngineFreqs = new Array(ENGINE_COUNT).fill(20); // Tracker for UI Oscilloscope
         
         // PRE-SCALE & METERING NODES
         let hpFilter, lpFilter, rawAnalyser, postGainAnalyser, filteredAnalyser;
@@ -291,7 +288,7 @@
 
         let isRecording = false, mediaRecorder = null, recordedChunks =[], recordStartTime = 0, recordLimitSecs = 300;
         let scriptProcessor = null, wavAudioBuffer =[]; 
-        let lastMeterUpdate = 0; // Throttle DB Meter UI
+        let lastMeterUpdate = 0;
 
         const micBtn = document.getElementById('mic-btn');
         const audioOutputToggle = document.getElementById('audio-output-toggle');
@@ -303,7 +300,6 @@
         const fftCanvas = document.getElementById('fft-canvas');
         const fftCtx = fftCanvas.getContext('2d', { alpha: false });
 
-        // --- MIC VOLUME LISTENER ---
         document.getElementById('mic-vol-pct').addEventListener('input', (e) => {
             if(preGainNode && audioContext) {
                 const pct = Math.max(0, parseFloat(e.target.value) || 0);
@@ -311,7 +307,6 @@
             }
         });
 
-        // --- BANDPASS LISTENERS ---
         function updateBandpass() {
             if (!audioContext || !hpFilter || !lpFilter) return;
             const enabled = document.getElementById('bp-enable').checked;
@@ -334,6 +329,7 @@
             const defaultTime = LFO_TIMES[i % 10];
             const defaultStart = 20 + (19980) * (i / 19);
             const defaultEnd = 20.0;
+            currentEngineFreqs[i] = defaultStart; // Sync visualizer to default
             
             instancesContainer.innerHTML += `
             <div class="instance-card active-card" id="card-${i}">
@@ -376,7 +372,6 @@
             }
         });
 
-        // The specific sweep generator target array requested
         document.getElementById('apply-sweep-btn').addEventListener('click', () => {
             const mode = document.getElementById('sweep-mode').value;
 
@@ -391,15 +386,10 @@
                     endHz = 20000;
                 } else if (mode === 'split') {
                     let halfIndex = i % 10;
-                    startHz = 20 + (19980) * (halfIndex / 9); // Evenly spread across 20-20k for both halves
-                    if (i < 10) {
-                        endHz = 20; // First half descends to 20Hz
-                    } else {
-                        endHz = 20000; // Second half ascends to 20kHz
-                    }
+                    startHz = 20 + (19980) * (halfIndex / 9); 
+                    if (i < 10) endHz = 20; else endHz = 20000; 
                 }
                 
-                // Update UI and trigger Engine update, resetting LFO times so both halves match
                 document.getElementById(`eng-start-${i}`).value = startHz.toFixed(3);
                 document.getElementById(`eng-end-${i}`).value = endHz.toFixed(3);
                 document.getElementById(`eng-time-${i}`).value = LFO_TIMES[i % 10]; 
@@ -438,7 +428,10 @@
                 lfoTime: parseFloat(document.getElementById(`eng-time-${idx}`).value) || 15
             };
             
-            if(!engineLfoStates[idx]) config.currentFreq = config.lfoStart; // Reset to start if not running LFO
+            if(!engineLfoStates[idx]) {
+                config.currentFreq = config.lfoStart; 
+                currentEngineFreqs[idx] = config.currentFreq; // Sync UI Array
+            }
 
             liveMathNode.port.postMessage({ type: 'updateEngine', index: idx, engineData: config });
 
@@ -447,7 +440,6 @@
             if(config.active) { card.classList.add('active-card'); if(isRunning) led.classList.add('on'); } 
             else { card.classList.remove('active-card'); led.classList.remove('on'); }
             
-            // Immediately update the text readout
             document.getElementById(`eng-readout-${idx}`).innerText = config.currentFreq ? config.currentFreq.toFixed(3) + ' Hz' : config.lfoStart.toFixed(3) + ' Hz';
         }
 
@@ -561,7 +553,6 @@
                 
                 microphone = audioContext.createMediaStreamSource(stream);
                 
-                // --- SETUP PRE-GAIN & METERING ---
                 preGainNode = audioContext.createGain();
                 const initVol = parseFloat(document.getElementById('mic-vol-pct').value) || 100;
                 preGainNode.gain.value = initVol / 100.0;
@@ -569,7 +560,6 @@
                 rawAnalyser = audioContext.createAnalyser(); rawAnalyser.fftSize = 2048;
                 postGainAnalyser = audioContext.createAnalyser(); postGainAnalyser.fftSize = 2048;
 
-                // --- SETUP BANDPASS & FFT NODES ---
                 hpFilter = audioContext.createBiquadFilter(); hpFilter.type = 'highpass';
                 lpFilter = audioContext.createBiquadFilter(); lpFilter.type = 'lowpass';
                 
@@ -583,7 +573,6 @@
                 micBypassGain = audioContext.createGain(); micBypassGain.gain.value = 1;
                 filteredGain = audioContext.createGain(); filteredGain.gain.value = 0;
 
-                // Routing: Mic -> PreGain -> HP -> LP -> Math Node
                 microphone.connect(rawAnalyser);
                 microphone.connect(preGainNode);
                 preGainNode.connect(postGainAnalyser);
@@ -595,6 +584,7 @@
                 liveMathNode = new AudioWorkletNode(audioContext, 'freqshifter-processor');
                 liveMathNode.port.onmessage = (e) => {
                     if (e.data.type === 'status') {
+                        currentEngineFreqs = e.data.freqs; // Capture frequencies for Oscilloscope UI
                         for(let i=0; i<ENGINE_COUNT; i++) {
                             if(document.getElementById(`eng-active-${i}`).checked) 
                                 document.getElementById(`eng-readout-${i}`).innerText = e.data.freqs[i].toFixed(3) + ' Hz';
@@ -620,7 +610,6 @@
                 chopperGain = audioContext.createGain(); chopperGain.gain.value = 0.5; 
                 chopperOsc.connect(chopperGain); chopperOsc.start();
 
-                // Connect Main Signal Chain
                 micBypassGain.connect(liveMathNode);
                 filteredGain.connect(liveMathNode);
                 liveMathNode.connect(outAnalyser);
@@ -638,7 +627,6 @@
                 
                 for(let i=0; i<ENGINE_COUNT; i++) { if(document.getElementById(`eng-active-${i}`).checked && document.getElementById(`card-${i}`).style.display !== 'none') document.getElementById(`led-${i}`).classList.add('on'); }
 
-                // Sync canvas resolutions
                 masterCanvas.width = masterCanvas.clientWidth; masterCanvas.height = masterCanvas.clientHeight;
                 fftCanvas.width = fftCanvas.clientWidth; fftCanvas.height = fftCanvas.clientHeight;
                 
@@ -719,7 +707,6 @@
             setTimeout(() => { document.body.removeChild(a); window.URL.revokeObjectURL(url); recordStatus.innerText = "Saved successfully!"; }, 100);
         }
 
-        // --- MASTER VISUALIZERS & DB METER ---
         const getDB = (arr) => {
             let sum = 0; for(let i=0; i<arr.length; i++) sum += arr[i]*arr[i];
             let rms = Math.sqrt(sum / arr.length);
@@ -730,14 +717,12 @@
             if (!isRunning) return;
             animationId = requestAnimationFrame(processVisualizer);
             
-            // 1. 3D Rotation
             if (document.getElementById('ac-rotate').checked && panner) {
                 const t = audioContext.currentTime;
                 panner.positionX.setValueAtTime(Math.sin(t * 2.0) * 2, t);
                 panner.positionZ.setValueAtTime(Math.cos(t * 2.0) * 2, t);
             }
 
-            // 2. DB Meter Updates
             if (timestamp - lastMeterUpdate > 100) {
                 rawAnalyser.getFloatTimeDomainData(rawTimeData);
                 postGainAnalyser.getFloatTimeDomainData(postTimeData);
@@ -746,20 +731,57 @@
                 lastMeterUpdate = timestamp;
             }
 
-            // 3. Oscilloscope
+            // --- MULTI-ENGINE HOLOGRAPHIC OSCILLOSCOPE ---
             outAnalyser.getFloatTimeDomainData(outDataArray);
+            masterCtx.fillStyle = '#000000'; 
+            masterCtx.fillRect(0, 0, masterCanvas.width, masterCanvas.height);
+            
             const dataLength = outDataArray.length;
-            masterCtx.fillStyle = '#000000'; masterCtx.fillRect(0, 0, masterCanvas.width, masterCanvas.height);
-            masterCtx.lineWidth = 2; masterCtx.strokeStyle = '#00e5ff'; masterCtx.beginPath();
-            const sliceWidth = masterCanvas.width / dataLength; const heightHalf = masterCanvas.height / 2;
-            let x = 0;
+            const sliceWidth = masterCanvas.width / dataLength; 
+            const heightHalf = masterCanvas.height / 2;
+            const time = audioContext.currentTime;
+
+            // 1. Draw the 20 Engine Frequencies in the background
+            masterCtx.globalAlpha = 0.35; // Semi-transparent
+            for(let i = 0; i < ENGINE_COUNT; i++) {
+                if(!document.getElementById(`eng-active-${i}`).checked) continue;
+                
+                masterCtx.beginPath();
+                // Generate a full spectrum rainbow color per engine
+                masterCtx.strokeStyle = `hsl(${(i * 360 / ENGINE_COUNT)}, 100%, 60%)`;
+                masterCtx.lineWidth = 1;
+                
+                // Map mathematical frequency to visual sine wave speed (logarithmically)
+                let freq = currentEngineFreqs[i] || 20;
+                let visualFreq = Math.max(1, Math.log10(freq) * 12); 
+                
+                let xBg = 0;
+                for (let j = 0; j < dataLength; j++) {
+                    const y = (Math.sin((j / dataLength) * Math.PI * 2 * visualFreq + (time * visualFreq * 1.5)) * (heightHalf * 0.8)) + heightHalf;
+                    j === 0 ? masterCtx.moveTo(xBg, y) : masterCtx.lineTo(xBg, y); 
+                    xBg += sliceWidth;
+                }
+                masterCtx.stroke();
+            }
+            masterCtx.globalAlpha = 1.0; // Reset opacity
+
+            // 2. Draw the Master Mixed Audio Signal (Foreground)
+            masterCtx.lineWidth = 2; 
+            masterCtx.strokeStyle = '#e0e0e0'; // Bright white/gray for the master mix
+            masterCtx.shadowBlur = 5;
+            masterCtx.shadowColor = '#00e5ff';
+            masterCtx.beginPath();
+            
+            let xOut = 0;
             for (let i = 0; i < dataLength; i++) {
                 const y = (outDataArray[i] * heightHalf) + heightHalf;
-                i === 0 ? masterCtx.moveTo(x, y) : masterCtx.lineTo(x, y); x += sliceWidth;
+                i === 0 ? masterCtx.moveTo(xOut, y) : masterCtx.lineTo(xOut, y); 
+                xOut += sliceWidth;
             }
             masterCtx.stroke();
+            masterCtx.shadowBlur = 0; // Reset shadow
 
-            // 4. FFT Graph
+            // --- FFT SPECTRAL GRAPH ---
             rawAnalyser.getByteFrequencyData(rawFreqData);
             filteredAnalyser.getByteFrequencyData(filteredFreqData);
 
@@ -791,8 +813,6 @@
         }
 
         document.getElementById('mic-btn').addEventListener('click', toggleMic);
-        
-        // Initial setup for the UI defaults (trigger engine visibility setup)
         document.getElementById('apply-master-engines-btn').click();
     </script>
 </body>
