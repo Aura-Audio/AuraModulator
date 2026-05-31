@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AuraModulator - 20-Engine Frequency Array (v1.2.0)</title>
+    <title>AuraModulator - 20-Engine Frequency Array (v1.3.0)</title>
     <style>
         :root {
             --bg: #0f1115; --surface: #1a1d24; --primary: #00e5ff;
@@ -46,7 +46,7 @@
 <body>
 
     <div class="header">
-        <h1>AuraModulator <span style="font-size: 0.5em; color: var(--primary);">(20-Engine Freq Array v1.2.0)</span></h1>
+        <h1>AuraModulator <span style="font-size: 0.5em; color: var(--primary);">(20-Engine Freq Array v1.3.0)</span></h1>
         <p>Mathematical Multi-Track Dual-Sideband Ring Modulator</p>
     </div>
 
@@ -96,7 +96,6 @@
         <h2 style="margin: 0; color: var(--info); font-size: 1.2em;">Frequency Array Dashboard</h2>
         
         <div class="dash-header-controls">
-            <!-- MASTER ENGINE CONFIGURATOR -->
             <div style="display: flex; align-items: center; gap: 5px;">
                 <label style="color: var(--primary); font-weight: bold;">Engines:</label>
                 <input type="number" id="master-engines-count" class="ui-num" min="1" max="20" value="20" style="width: 50px;">
@@ -177,14 +176,14 @@
         const ENGINE_COUNT = 20; 
         const LFO_TIMES = [0.001, 0.01, 0.1, 1, 2, 5, 10, 30, 60, 120];
 
-        // --- 1. AUDIOWORKLET INJECTION (MULTI-TRACK WAVETABLE SHIFTER) ---
+        // --- 1. ZERO-BRANCH DSP WORKLET INJECTION ---
         const workletCode = `
         class MultiTrackShifterProcessor extends AudioWorkletProcessor {
             constructor() {
                 super();
                 this.globalSampleCounter = 0;
                 
-                // WAVETABLE OPTIMIZATION: Calculate math.sin once instead of 1 billion times/sec
+                // v1.3 OPTIMIZATION: 8192-point Fast Sine Wavetable
                 this.sineTableSize = 8192;
                 this.sineTable = new Float32Array(this.sineTableSize);
                 for(let i = 0; i < this.sineTableSize; i++) {
@@ -193,18 +192,15 @@
 
                 const lfoTimes = [0.001, 0.01, 0.1, 1, 2, 5, 10, 30, 60, 120];
                 const engineArray = Array(${ENGINE_COUNT}).fill().map((_, i) => {
+                    // v1.3 OPTIMIZATION: 32-bit Unsigned Integer Arrays for Phase Tracking
+                    let phases = new Uint32Array(1000);
+                    for(let p=0; p<1000; p++) phases[p] = Math.floor(Math.random() * 4294967296);
+                    
                     return {
-                        active: true, 
-                        lfoActive: false, 
-                        lfoStart: 20, 
-                        lfoEnd: 20.0, 
-                        lfoTime: lfoTimes[i % 10], 
-                        currentFreq: 20, 
-                        lfoSamples: 0,
-                        tracks: 100,
-                        trackSpread: 5.0,
-                        // Pre-allocate up to 1000 track phases, randomized to prevent phase explosion clipping
-                        phases: Float32Array.from({length: 1000}, () => Math.random())
+                        active: true, lfoActive: false, lfoStart: 20, lfoEnd: 20.0, lfoTime: lfoTimes[i % 10], 
+                        currentFreq: 20, lfoSamples: 0, tracks: 100, trackSpread: 5.0,
+                        phases: phases,
+                        phaseSteps: new Uint32Array(1000)
                     };
                 });
 
@@ -214,14 +210,18 @@
                     engines: engineArray
                 };
 
+                // v1.3 OPTIMIZATION: Low-GC Status Buffer allocated once
+                this.statusBuffer = new Float32Array(${ENGINE_COUNT});
+                this.statusFrameCount = 0;
+
                 this.port.onmessage = (e) => {
                     if (e.data.type === 'config') this.config = { ...this.config, ...e.data };
                     if (e.data.type === 'updateEngine') {
                         this.config.engines[e.data.index] = { ...this.config.engines[e.data.index], ...e.data.engineData };
                     }
                 };
-                this.statusFrameCount = 0;
             }
+
             process(inputs, outputs) {
                 const input = inputs[0];
                 const output = outputs[0];
@@ -230,19 +230,33 @@
                 const channelOut = output[0];
                 const numFrames = channelIn.length;
 
-                // 1. Advance Engine Base LFOs
+                const MAX_INT32 = 4294967296; 
+                const HZ_TO_STEP = MAX_INT32 / sampleRate;
+
+                // 1. PRE-CALCULATION BLOCK: Math hoisted outside the per-sample loop
                 for (let e = 0; e < ${ENGINE_COUNT}; e++) {
                     let eng = this.config.engines[e];
-                    if (eng.active && eng.lfoActive) {
+                    if (!eng.active) continue;
+                    
+                    if (eng.lfoActive) {
                         const totalSamples = eng.lfoTime * sampleRate;
                         eng.lfoSamples += numFrames;
                         if (eng.lfoSamples >= totalSamples) eng.lfoSamples %= totalSamples; 
                         let progress = eng.lfoSamples / totalSamples;
                         eng.currentFreq = eng.lfoStart + ((eng.lfoEnd - eng.lfoStart) * progress);
                     }
+
+                    let baseFreq = eng.currentFreq;
+                    let spread = eng.trackSpread;
+                    let tCount = eng.tracks;
+                    
+                    // Pre-calculate track steps once per 128 samples, instead of 20,000 times per sample
+                    for(let t = 0; t < tCount; t++) {
+                        eng.phaseSteps[t] = (baseFreq + (t * spread)) * HZ_TO_STEP;
+                    }
                 }
 
-                // 2. Process Multi-Track Audio Array
+                // 2. THE ZERO-BRANCH PER-SAMPLE DSP LOOP
                 for (let i = 0; i < numFrames; i++) {
                     let allowed = true;
                     if (this.config.inGateEnabled && (Math.floor(this.globalSampleCounter / this.config.inGateSamples) % 2 !== 0)) allowed = false;
@@ -258,35 +272,29 @@
                     for (let e = 0; e < ${ENGINE_COUNT}; e++) {
                         let eng = this.config.engines[e];
                         if (!eng.active) continue;
-                        
+
                         let tCount = eng.tracks;
-                        let spread = eng.trackSpread;
-                        let baseFreq = eng.currentFreq;
                         totalActiveTracks += tCount;
 
                         for(let t = 0; t < tCount; t++) {
-                            // Track logic: Start Base + spacing interval
-                            let trackFreq = baseFreq + (t * spread);
-                            
-                            // Wavetable Fast Sine Lookup
-                            let phaseIdx = (eng.phases[t] * this.sineTableSize) | 0; // fast integer floor
+                            // Bitwise shift extracts top 13 bits (8192 index bounds)
+                            let phaseIdx = eng.phases[t] >>> 19; 
                             mixedOutput += val * this.sineTable[phaseIdx];
-
-                            // Advance normalized Phase (0.0 to 1.0)
-                            eng.phases[t] += trackFreq / sampleRate;
-                            if(eng.phases[t] >= 1.0) eng.phases[t] -= 1.0;
-                            if(eng.phases[t] < 0.0) eng.phases[t] += 1.0;
+                            
+                            // Branchless Integer Overflow: Safely wraps 0 to 4294967295
+                            eng.phases[t] += eng.phaseSteps[t]; 
                         }
                     }
 
-                    // Deep Math Normalization (Square root handles thousands of tracks safely)
+                    // Root Mean Normalization
                     channelOut[i] = totalActiveTracks > 0 ? (mixedOutput / Math.sqrt(totalActiveTracks)) : val;
                     this.globalSampleCounter++;
                 }
 
-                // Send GUI Updates
+                // 3. LOW-GC TELEMETRY
                 if (this.statusFrameCount++ > 5) {
-                    this.port.postMessage({ type: 'status', freqs: this.config.engines.map(e => e.currentFreq) });
+                    for(let e = 0; e < ${ENGINE_COUNT}; e++) this.statusBuffer[e] = this.config.engines[e].currentFreq;
+                    this.port.postMessage({ type: 'status', freqs: this.statusBuffer });
                     this.statusFrameCount = 0;
                 }
                 return true;
@@ -302,9 +310,8 @@
         let isRunning = false, animationId;
         
         let liveMathNode, fxHubIn, fxHubOut, convolver, panner, outputGain, chopperOsc, chopperGain; 
-        
         let outAnalyser, outDataArray;
-        let currentEngineFreqs = new Array(ENGINE_COUNT).fill(20);
+        let currentEngineFreqs = new Float32Array(ENGINE_COUNT);
         
         let hpFilter, lpFilter, rawAnalyser, postGainAnalyser, filteredAnalyser;
         let rawFreqData, filteredFreqData, rawTimeData, postTimeData;
@@ -392,7 +399,7 @@
         // 💥 Guaranteed ZERO-OVERLAP Sweep Stacker Generator 💥
         document.getElementById('apply-sweep-btn').addEventListener('click', () => {
             const mode = document.getElementById('sweep-mode').value;
-            let currentStartStackHz = 20; // Anchor entire array at 20Hz
+            let currentStartStackHz = 20; 
 
             for(let i=0; i<ENGINE_COUNT; i++) {
                 let trks = parseInt(document.getElementById(`eng-tracks-${i}`).value) || 100;
@@ -410,8 +417,6 @@
                 document.getElementById(`eng-time-${i}`).value = LFO_TIMES[i % 10]; 
                 
                 sendEngineConfig(i);
-
-                // Math to ensure next engine starts AFTER this engine's massive track footprint
                 currentStartStackHz += (trks * sprd); 
             }
         });
@@ -572,6 +577,7 @@
                 liveMathNode = new AudioWorkletNode(audioContext, 'multitrackshifter-processor');
                 liveMathNode.port.onmessage = (e) => {
                     if (e.data.type === 'status') {
+                        // v1.3 OPTIMIZATION: Assigns directly from the Float32Array payload
                         currentEngineFreqs = e.data.freqs; 
                         for(let i=0; i<ENGINE_COUNT; i++) if(document.getElementById(`eng-active-${i}`).checked) document.getElementById(`eng-readout-${i}`).innerText = e.data.freqs[i].toFixed(3) + ' Hz';
                     }
@@ -692,9 +698,11 @@
                 if(!document.getElementById(`eng-active-${i}`).checked) continue;
                 masterCtx.beginPath(); masterCtx.strokeStyle = `hsl(${(i * 360 / ENGINE_COUNT)}, 100%, 60%)`;
                 let trks = parseInt(document.getElementById(`eng-tracks-${i}`).value);
-                masterCtx.lineWidth = Math.min(5, 1 + (trks / 200)); // Thicker lines for more tracks
+                masterCtx.lineWidth = Math.min(5, 1 + (trks / 200)); 
                 let visualFreq = Math.max(1, Math.log10(currentEngineFreqs[i] || 20) * 12); 
-                for (let j = 0, x = 0; j < outDataArray.length; j++, x+=sliceWidth) {
+                
+                // v1.3 OPTIMIZATION: Canvas Decimation (j+=4) saves ~75% UI Rendering Overhead
+                for (let j = 0, x = 0; j < outDataArray.length; j += 4, x += (sliceWidth * 4)) {
                     const y = (Math.sin((j / outDataArray.length) * Math.PI * 2 * visualFreq + (audioContext.currentTime * visualFreq * 1.5)) * (heightHalf * 0.8)) + heightHalf;
                     j === 0 ? masterCtx.moveTo(x, y) : masterCtx.lineTo(x, y); 
                 } masterCtx.stroke();
